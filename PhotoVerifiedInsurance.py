@@ -156,6 +156,7 @@ class PhotoVerifiedInsurance(gl.Contract):
         if len(photo_url.strip()) == 0:
             raise gl.vm.UserError("[EXPECTED] a photo url is required")
 
+        # ابطال بیمه‌نامه برای جلوگیری از ارسال تکراری
         self.policies[policy_id].active = False
 
         pool_id = policy.pool_id
@@ -228,6 +229,8 @@ class PhotoVerifiedInsurance(gl.Contract):
                 _Recipient(policy.holder).emit_transfer(value=payout_amount)
         elif approved:
             status = "approved"
+
+        updated_pool = self.pools[pool_id]
 
         self.claims[claim_id] = Claim(
             policy_id=policy_id,
