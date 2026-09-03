@@ -26,6 +26,7 @@ class Pool:
     premium: u256
     max_payout: u256
     balance: u256
+    reserved_balance: u256  # O(1) Liability Tracking
     active: bool
 
 @allow_storage
@@ -85,6 +86,7 @@ class PhotoVerifiedInsurance(gl.Contract):
             premium=premium,
             max_payout=max_payout,
             balance=seed,
+            reserved_balance=u256(0),
             active=True,
         )
         return pool_id
@@ -108,8 +110,15 @@ class PhotoVerifiedInsurance(gl.Contract):
             raise gl.vm.UserError("[EXPECTED] only the pool owner may withdraw")
         if amount == u256(0):
             raise gl.vm.UserError("[EXPECTED] amount must be greater than zero")
-        if amount > pool.balance:
-            raise gl.vm.UserError("[EXPECTED] amount exceeds pool balance")
+        
+        # Calculate free balance (funds not reserved for active policies)
+        if pool.balance < pool.reserved_balance:
+            free_balance = u256(0)
+        else:
+            free_balance = pool.balance - pool.reserved_balance
+
+        if amount > free_balance:
+            raise gl.vm.UserError("[EXPECTED] amount exceeds free balance (reserved for active policies)")
 
         self.pools[pool_id].balance = pool.balance - amount
         _Recipient(pool.owner).emit_transfer(value=amount)
@@ -129,6 +138,13 @@ class PhotoVerifiedInsurance(gl.Contract):
                 f"[EXPECTED] premium mismatch: expected {pool.premium}, got {paid}"
             )
 
+        # Enforce Solvency: Pool MUST be able to cover the max payout of this new policy
+        projected_balance = pool.balance + paid
+        new_reserved = pool.reserved_balance + pool.max_payout
+        
+        if projected_balance < new_reserved:
+            raise gl.vm.UserError("[EXPECTED] pool lacks sufficient reserve to honor new policy")
+
         policy_id = self.next_policy_id
         self.next_policy_id = self.next_policy_id + 1
 
@@ -138,7 +154,10 @@ class PhotoVerifiedInsurance(gl.Contract):
             purchased_at=datetime.now(timezone.utc).isoformat(),
             active=True,
         )
-        self.pools[pool_id].balance = self.pools[pool_id].balance + paid
+        
+        self.pools[pool_id].balance = projected_balance
+        self.pools[pool_id].reserved_balance = new_reserved
+        
         return policy_id
 
     @gl.public.write
@@ -155,8 +174,6 @@ class PhotoVerifiedInsurance(gl.Contract):
             raise gl.vm.UserError("[EXPECTED] policy is not active or already used")
         if len(photo_url.strip()) == 0:
             raise gl.vm.UserError("[EXPECTED] a photo url is required")
-
-        self.policies[policy_id].active = False
 
         pool_id = policy.pool_id
         pool = self.pools[pool_id]
@@ -208,7 +225,17 @@ class PhotoVerifiedInsurance(gl.Contract):
                 and validator_result["severity"] == leaders_res.calldata["severity"]
             )
 
+        # 1. AI Consensus Block
         result = gl.vm.run_nondet_unsafe(leader_fn, validator_fn)
+
+        # 2. STATE MUTATIONS (Always AFTER run_nondet_unsafe)
+        self.policies[policy_id].active = False
+        
+        # Free the reserved liability defensively (Underflow protection)
+        if self.pools[pool_id].reserved_balance >= pool.max_payout:
+            self.pools[pool_id].reserved_balance = self.pools[pool_id].reserved_balance - pool.max_payout
+        else:
+            self.pools[pool_id].reserved_balance = u256(0)
 
         claim_id = self.next_claim_id
         self.next_claim_id = self.next_claim_id + 1
@@ -219,17 +246,18 @@ class PhotoVerifiedInsurance(gl.Contract):
         payout_amount = u256((int(pool.max_payout) * bps) // 10000)
 
         status = "denied"
+        
         if approved and payout_amount > u256(0):
-            if payout_amount > pool.balance:
-                payout_amount = pool.balance
+            # Fallback cap to prevent overdrawing 
+            if payout_amount > self.pools[pool_id].balance:
+                payout_amount = self.pools[pool_id].balance
+                
             if payout_amount > u256(0):
                 status = "approved"
-                self.pools[pool_id].balance = pool.balance - payout_amount
+                self.pools[pool_id].balance = self.pools[pool_id].balance - payout_amount
                 _Recipient(policy.holder).emit_transfer(value=payout_amount)
         elif approved:
             status = "approved"
-
-        updated_pool = self.pools[pool_id]
 
         self.claims[claim_id] = Claim(
             policy_id=policy_id,
@@ -255,6 +283,7 @@ class PhotoVerifiedInsurance(gl.Contract):
             "premium": str(pool.premium),
             "max_payout": str(pool.max_payout),
             "balance": str(pool.balance),
+            "reserved_balance": str(pool.reserved_balance),
             "active": pool.active,
         }
 
